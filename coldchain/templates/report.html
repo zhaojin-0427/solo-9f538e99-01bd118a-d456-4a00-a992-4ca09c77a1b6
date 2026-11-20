@@ -22,6 +22,7 @@
   <button type="submit">查询</button>
   {% if report %}
     <a class="button ghost" href="{{ url_for('api_report', month=report.month, version=report.version.version_no if report.version else '') }}">JSON</a>
+    <a class="button ghost" href="{{ url_for('api_clock_analysis', month=report.month, version=report.version.version_no if report.version else '') }}">钟差分析 JSON</a>
   {% endif %}
 </form>
 
@@ -66,6 +67,44 @@
       </tr>
       </tbody>
     </table>
+  </section>
+
+  <section class="card" id="clock-analysis">
+    <h2>钟差分析
+      {% if report.clock_analysis.offset_min == 0 and report.clock_analysis.offset_max == 0 %}
+        <span class="badge badge-warn">月结未填偏移范围，按 0 秒</span>
+      {% else %}
+        <span class="badge">允许偏移 {{ '%+d'|format(report.clock_analysis.offset_min) }} 到 {{ '%+d'|format(report.clock_analysis.offset_max) }} 秒</span>
+      {% endif %}
+    </h2>
+    <p class="muted">
+      下表统计出库时刻加上该月结允许范围内任一整数秒偏移后，各温区（及未归类项）可能命中的箱数上下界；
+      每个极值附一个能达到它的偏移量（秒）。下方「{{ report.month }} 汇总」及明细仍按原出库时刻统计，不受偏移影响。
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>温区 / 未归类</th>
+          <th>箱数下界</th>
+          <th>达到下界的偏移</th>
+          <th>箱数上界</th>
+          <th>达到上界的偏移</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in report.clock_analysis.rows %}
+        <tr class="{{ 'unclassified-row' if row.unclassified else '' }}">
+          <td>{% if row.unclassified %}<a href="#unclassified">未归类</a>{% else %}<strong>{{ row.zone }}</strong>{% endif %}</td>
+          <td><strong>{{ row.min_boxes }}</strong></td>
+          <td class="mono">{{ '%+d'|format(row.min_offset) }} 秒</td>
+          <td><strong>{{ row.max_boxes }}</strong></td>
+          <td class="mono">{{ '%+d'|format(row.max_offset) }} 秒</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted">各温区的极值可能来自不同偏移，因此各行上下界之间不要求可同时达到；
+       但在任一固定偏移下，各温区与未归类项的箱数之和恒为 {{ report.clock_analysis.total_boxes }} 箱。</p>
   </section>
 
   {% for bucket in report.zones %}

@@ -167,10 +167,19 @@ def create_app(test_config=None):
             raw,
             filename=upload.filename,
             expected_month=request.form.get("month") or None,
+            offset_min=request.form.get("clock_offset_min"),
+            offset_max=request.form.get("clock_offset_max"),
         )
+        if result["clock_offset_min"] == 0 and result["clock_offset_max"] == 0:
+            range_text = "未填钟差偏移范围，按 0 秒计算"
+        else:
+            range_text = (
+                "钟差偏移范围 "
+                f"{result['clock_offset_min']:+d} 到 {result['clock_offset_max']:+d} 秒"
+            )
         flash(
-            f"{result['month']} 已固定：{result['row_count']} 行，共 {result['total_boxes']} 箱。"
-            "该月事实此后不可修改。",
+            f"{result['month']} 已固定：{result['row_count']} 行，共 {result['total_boxes']} 箱；"
+            f"{range_text}。该月事实此后不可修改。",
             "success",
         )
         return redirect(url_for("report_page", month=result["month"]))
@@ -278,6 +287,8 @@ def create_app(test_config=None):
             upload.read(),
             filename=upload.filename,
             expected_month=request.form.get("month") or None,
+            offset_min=request.form.get("clock_offset_min"),
+            offset_max=request.form.get("clock_offset_max"),
         )
         result["ok"] = True
         return jsonify(result), 201
@@ -326,6 +337,22 @@ def create_app(test_config=None):
             raise ValidationError("缺少 month 参数（YYYY-MM）")
         report = knowledge.build_report(db, month, request.args.get("version") or None)
         return jsonify({"ok": True, **knowledge.report_json(report)})
+
+    @app.get("/api/clock-analysis")
+    def api_clock_analysis():
+        db = get_db()
+        month = request.args.get("month")
+        if not month:
+            raise ValidationError("缺少 month 参数（YYYY-MM）")
+        report = knowledge.build_report(db, month, request.args.get("version") or None)
+        payload = {
+            "ok": True,
+            "month": report["month"],
+            "version": report["version"],
+            "month_fact": report["month_row"],
+            "clock_analysis": report["clock_analysis"],
+        }
+        return jsonify(payload)
 
     @app.get("/api/audit")
     def api_audit():

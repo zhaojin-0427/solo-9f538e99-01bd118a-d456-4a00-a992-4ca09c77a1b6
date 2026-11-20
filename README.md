@@ -35,19 +35,43 @@ COLDCHAIN_DB=/tmp/cc.sqlite3 gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 
 1. **上传月结**：上传单月出库 CSV。列为 `流水号,SKU,出库时刻,箱数`（也接受常见别名，
    如 `出库流水号 / 商品编码 / 出库时间 / 件数`）。时刻为 ISO-8601，可带 `Z` 或偏移量，
    统一换算为 UTC；文件必须同属一个 UTC 月份，流水号全局唯一，箱数为正整数。
-   校验失败时**一行都不会写入**；成功后该月事实永久固定，重复上传返回冲突。
+   可同时填写出库设备的**钟差偏移范围**（整数秒，上下限均在 -3600 到 3600 之间，整份
+   CSV 共用同一个偏移；上下限必须同时填写或同时留空，留空及旧月结按 0 秒处理）。
+   若范围内任一允许偏移会把某笔流水移到其他 UTC 月，系统会指出全部相关流水号并整份拒绝；
+   其他校验失败同样**一行都不会写入**。成功后该月事实（含偏移范围）永久固定，重复上传返回冲突。
 2. **登记温区**：按 SKU 登记 `[生效, 失效)` 区间（起含止不含），失效留空表示持续有效。
    同一版号内同一 SKU 的区间不得重叠；整组提交即整组替换，并生成新知识版号。
-3. **核对月报**：选择月份和知识版号（留空=最新版），查看各温区箱数、每笔对应流水
-   及其依据区间，以及未归类流水。空档期间的出库自动列为未归类。
+3. **核对月报**：选择月份和知识版号（留空=最新版）。页面分两部分：
+   - **原月报**始终按原出库时刻统计各温区箱数、每笔对应流水及其依据区间，以及未归类流水；
+   - **钟差分析**按该月结保存的偏移范围，对每个可能命中的温区和未归类项给出箱数上下界，
+     每个极值都附一个能达到它的整数秒偏移。空档期间的出库自动列为未归类。
 
-示例文件：`examples/2026-03.csv`（可用 `python examples/make_example.py` 重新生成）。
+示例文件：`examples/2026-03.csv`（可用 `python examples/make_example.py` 重新生成；
+该示例全部流水距 UTC 月边界超过一小时，可直接配合 -3600 到 3600 的偏移范围上传）。
+
+## 钟差分析如何做到不按偏移重算整月
+
+朴素做法是对范围内每个偏移（最多 7201 个）把整月流水（最多 5 万笔）重新分类一次，
+即约 3.6 亿次区间判定。实现采用**事件扫描线**：
+
+- 一笔流水的温区只有在「偏移后时刻穿过该 SKU 某条区间边界」时才会变化；每条边界对应
+  至多一个整数秒穿越偏移 `ceil((边界 - 出库时刻) / 1秒)`，因此每笔流水在整个范围内只
+  产生少量事件，与范围宽度无关。
+- 先按偏移排序全部事件，再从小到大扫描一遍，维护各温区的运行箱数合计；每个偏移点上
+  只需处理该点发生的事件（一次减箱、一次加箱），并记录各温区当前合计的最小/最大值及
+  达到它的偏移。
+- 复杂度为 `O(流水数 × log 区间数 + 事件数 × log 事件数)`，5 万笔流水、7201 秒范围
+  在普通环境下亚秒级完成；箱数守恒由扫描线的结构保证（每次移动同数箱既减又加）。
 
 ## 关键规则如何落实
 
 | 要求 | 实现 |
 | --- | --- |
 | 上传成功后固定该月事实 | `months` 与 `shipments` 在同一 `BEGIN IMMEDIATE` 事务写入；数据库触发器禁止 `UPDATE/DELETE`；同月重复上传返回 409 |
+| 钟差偏移范围随月结保存 | `months.clock_offset_min/max`（-3600~3600 整数秒、min ≤ max，CHECK 约束）；留空与旧月结迁移后均为 0 |
+| 偏移导致跨 UTC 月则整份拒绝 | 只需验证范围两个极端偏移（月份只会在月界处变化）；命中即返回全部流水号与行号，事务外校验、零写入 |
+| 钟差分析给出箱数上下界及达到偏移 | `clock.py` 事件扫描线，按区间边界穿越事件单趟扫描，不按偏移重算整月 |
+| 原月报仍按原出库时刻 | 钟差分析是独立结构；`zones`/`unclassified` 仍以 `occurred_at_us`（零偏移）分类 |
 | 区间起含止不含 | 所有时点存为 UTC 微秒整数，判定 `valid_from_us <= t < valid_to_us` |
 | 同版同 SKU 不重叠 | 应用层排序校验 + SQLite 触发器 `ranges_no_overlap` 双重保护 |
 | 空档出库未归类 | `classify()` 返回空即为未归类，与已归类箱数之和恒等于月总箱数 |
@@ -64,12 +88,13 @@ COLDCHAIN_DB=/tmp/cc.sqlite3 gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/months` | 已固定月份列表 |
-| POST | `/api/months` | multipart 上传 `file`（可选表单字段 `month` 做校验） |
+| GET | `/api/months` | 已固定月份列表（含每月 `clock_offset_min/max`） |
+| POST | `/api/months` | multipart 上传 `file`；可选表单字段 `month` 做校验、`clock_offset_min`/`clock_offset_max` 填整数秒偏移范围（-3600~3600，同时填或同时留空） |
 | GET | `/api/versions` | 知识版号列表 |
 | POST | `/api/versions` | `{"sku","intervals":[{"zone","valid_from","valid_to"}],"reason","base_version"}` |
 | GET | `/api/versions/<n>` | 某版全部 SKU 区间 |
-| GET | `/api/report?month=YYYY-MM&version=<n>` | 月报（省略 `version` 用最新版） |
+| GET | `/api/report?month=YYYY-MM&version=<n>` | 月报（省略 `version` 用最新版），响应内含 `clock_analysis` 钟差分析 |
+| GET | `/api/clock-analysis?month=YYYY-MM&version=<n>` | 仅返回钟差分析：各温区/未归类的箱数上下界及达到极值的偏移 |
 | GET | `/api/audit` | 最近 200 条审计记录 |
 | GET | `/healthz` | 健康检查 |
 
@@ -81,21 +106,23 @@ COLDCHAIN_DB=/tmp/cc.sqlite3 gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 
 python -m unittest discover -s tests -v
 ```
 
-覆盖：月结冻结与重复拒绝、CSV 各类非法输入、起含止不含边界、空档未归类、
+覆盖：月结冻结与重复拒绝、CSV 各类非法输入、偏移范围校验与跨 UTC 月整份拒绝（含
+5 万笔规模）、钟差扫描线与逐偏移暴力枚举的随机对照、起含止不含边界、空档未归类、
 重叠/倒序区间拒绝、补登不改旧版、基准版号冲突、并发更正串行化、查询快照一致、
-重启后旧版可追查、数据库层不可变触发器等。
+重启后旧版可追查、旧数据库自动迁移零偏移列、数据库层不可变触发器等。
 
 ## 目录
 
 ```
 coldchain/
   app.py        Flask 路由与页面/API
-  facts.py      月结 CSV 校验与冻结
+  facts.py      月结 CSV 校验、偏移范围校验与冻结
+  clock.py      钟差偏移事件扫描线与箱数上下界分析
   knowledge.py  温区版本、区间校验、分类与报表
-  db.py         SQLite schema、触发器、事务
+  db.py         SQLite schema、触发器、事务与旧库迁移
   timeutil.py   UTC 解析与规范化
   templates/    页面
-tests/          单元与并发测试
+tests/          单元、并发与随机对照测试
 examples/       示例月结 CSV
 Dockerfile, docker-compose.yml
 ```

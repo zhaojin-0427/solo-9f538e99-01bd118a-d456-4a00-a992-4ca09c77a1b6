@@ -7,6 +7,7 @@ import hashlib
 import io
 import re
 import sqlite3
+from datetime import timedelta
 
 from .db import transaction
 from .errors import ConflictError, ValidationError
@@ -15,6 +16,8 @@ from .timeutil import datetime_to_us, format_utc, month_of, now_str, parse_utc, 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MAX_ROWS = 50_000
 MAX_ERRORS = 40
+CLOCK_OFFSET_LIMIT = 3600
+_OFFSET_RE = re.compile(r"^[+-]?[0-9]+$")
 
 FIELD_ALIASES = {
     "sequence_no": (
@@ -50,6 +53,60 @@ FIELD_LABELS = {
 _SKU_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 _SEQ_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 _BOXES_RE = re.compile(r"^[0-9]{1,9}$")
+
+
+def parse_offset_range(offset_min=None, offset_max=None):
+    """Validate the whole-file clock-offset range (integer seconds).
+
+    Both bounds must be given together, each an integer in
+    ``[-3600, 3600]``, with ``min <= max``. Two empty inputs mean the
+    range was not filled in and default to zero seconds (this also covers
+    every month frozen before the feature existed).
+    """
+    min_text = "" if offset_min is None else str(offset_min).strip()
+    max_text = "" if offset_max is None else str(offset_max).strip()
+    if not min_text and not max_text:
+        return 0, 0
+    if not min_text or not max_text:
+        raise ValidationError("钟差偏移上下限必须同时填写，或同时留空（按 0 秒处理）")
+    if not (_OFFSET_RE.match(min_text) and _OFFSET_RE.match(max_text)):
+        raise ValidationError("钟差偏移上下限必须是整数秒")
+    low, high = int(min_text), int(max_text)
+    if not (-CLOCK_OFFSET_LIMIT <= low <= CLOCK_OFFSET_LIMIT) or not (
+        -CLOCK_OFFSET_LIMIT <= high <= CLOCK_OFFSET_LIMIT
+    ):
+        raise ValidationError(f"钟差偏移上下限必须在 -{CLOCK_OFFSET_LIMIT} 到 {CLOCK_OFFSET_LIMIT} 秒之间")
+    if low > high:
+        raise ValidationError("钟差偏移下限不能大于上限")
+    return low, high
+
+
+def _find_month_crossing_rows(rows, offset_min, offset_max):
+    """Return sequence numbers pushed into another UTC month by some allowed offset.
+
+    Only the two extreme offsets have to be tried: an instant's month can
+    only change at a month boundary, and whether the boundary lies inside
+    ``[t + min, t + max]`` is fully determined by the endpoints.
+    """
+    offenders = []
+    extremes = {offset_min}
+    if offset_max != offset_min:
+        extremes.add(offset_max)
+    for row in rows:
+        original = row["occurred_at_dt"]
+        original_month = month_of(original)
+        for seconds in extremes:
+            if month_of(original + timedelta(seconds=seconds)) != original_month:
+                offenders.append(
+                    (
+                        row["source_row"],
+                        row["sequence_no"],
+                        seconds,
+                        month_of(original + timedelta(seconds=seconds)),
+                    )
+                )
+                break
+    return offenders
 
 
 def _norm_header(value):
@@ -98,11 +155,14 @@ def _header_map(fieldnames):
     return mapping
 
 
-def parse_csv(raw, expected_month=None):
+def parse_csv(raw, expected_month=None, offset_min=0, offset_max=0):
     """Parse and validate the entire file. Returns (month, rows, sha256).
 
     Nothing is written here; any error rejects the whole file so a month can
-    never become partially frozen.
+    never become partially frozen. The shared clock-offset range is checked
+    here too: if either extreme offset would move any shipment into another
+    UTC month the whole file is rejected and every offending sequence number
+    is reported.
     """
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
@@ -219,12 +279,30 @@ def parse_csv(raw, expected_month=None):
             raise ValidationError(
                 f"指定月份 {expected} 与 CSV 中出库时刻所属 UTC 月份 {month} 不一致"
             )
+    crossing = _find_month_crossing_rows(rows, offset_min, offset_max)
+    if crossing:
+        details = [
+            f"第 {line_no} 行：流水号 {sequence_no} 在偏移 {seconds:+d} 秒时落到 UTC 月 {other_month}"
+            for line_no, sequence_no, seconds, other_month in crossing[:MAX_ERRORS]
+        ]
+        if len(crossing) > MAX_ERRORS:
+            details.append(f"……另有 {len(crossing) - MAX_ERRORS} 笔，仅显示前若干条")
+        raise ValidationError(
+            "存在允许偏移会把出库时刻移到其他 UTC 月的流水，整份拒绝入库",
+            details=details,
+        )
     return month, rows, sha256
 
 
-def ingest_month(conn, raw, filename, expected_month=None):
+def ingest_month(conn, raw, filename, expected_month=None, offset_min=None, offset_max=None):
     """Validate then freeze one month. All-or-nothing."""
-    month, rows, sha256 = parse_csv(raw, expected_month=expected_month)
+    offset_min, offset_max = parse_offset_range(offset_min, offset_max)
+    month, rows, sha256 = parse_csv(
+        raw,
+        expected_month=expected_month,
+        offset_min=offset_min,
+        offset_max=offset_max,
+    )
     safe_name = (filename or "upload.csv").strip()[:255] or "upload.csv"
     total_boxes = sum(row["boxes"] for row in rows)
 
@@ -251,9 +329,18 @@ def ingest_month(conn, raw, filename, expected_month=None):
         frozen_at = now_str()
         try:
             conn.execute(
-                "INSERT INTO months(month, source_filename, source_sha256, row_count, total_boxes, frozen_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (month, safe_name, sha256, len(rows), total_boxes, frozen_at),
+                "INSERT INTO months(month, source_filename, source_sha256, row_count, total_boxes,"
+                " frozen_at, clock_offset_min, clock_offset_max) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    month,
+                    safe_name,
+                    sha256,
+                    len(rows),
+                    total_boxes,
+                    frozen_at,
+                    offset_min,
+                    offset_max,
+                ),
             )
             conn.executemany(
                 "INSERT INTO shipments(month, sequence_no, sku, occurred_at, occurred_at_us, boxes, source_row)"
@@ -273,9 +360,20 @@ def ingest_month(conn, raw, filename, expected_month=None):
             )
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"写入被拒绝：{exc}（未产生任何数据）") from exc
+        range_text = (
+            f"钟差偏移范围 [{offset_min:+d}, {offset_max:+d}] 秒"
+            if offset_min or offset_max
+            else "未填钟差偏移范围（按 0 秒）"
+        )
         conn.execute(
             "INSERT INTO audit_log(at, action, month, version_no, summary) VALUES(?,?,?,?,?)",
-            (frozen_at, "freeze_month", month, None, f"固定 {month} 共 {len(rows)} 行 / {total_boxes} 箱"),
+            (
+                frozen_at,
+                "freeze_month",
+                month,
+                None,
+                f"固定 {month} 共 {len(rows)} 行 / {total_boxes} 箱；{range_text}",
+            ),
         )
     return {
         "month": month,
@@ -283,11 +381,14 @@ def ingest_month(conn, raw, filename, expected_month=None):
         "total_boxes": total_boxes,
         "frozen_at": frozen_at,
         "sha256": sha256,
+        "clock_offset_min": offset_min,
+        "clock_offset_max": offset_max,
     }
 
 
 def list_months(conn):
     return conn.execute(
-        "SELECT m.month, m.row_count, m.total_boxes, m.frozen_at, m.source_filename"
+        "SELECT m.month, m.row_count, m.total_boxes, m.frozen_at, m.source_filename,"
+        " m.clock_offset_min, m.clock_offset_max"
         " FROM months m ORDER BY m.month DESC"
     ).fetchall()

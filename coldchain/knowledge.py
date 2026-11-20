@@ -13,6 +13,7 @@ import bisect
 import re
 import sqlite3
 
+from . import clock as clock_mod
 from .db import transaction
 from .errors import ConflictError, NotFoundError, ValidationError
 from .timeutil import (
@@ -383,6 +384,15 @@ def build_report(conn, month, requested_version=None):
             " FROM shipments WHERE month = ? ORDER BY occurred_at_us, id",
             (month,),
         ).fetchall()
+        offset_min = month_row["clock_offset_min"]
+        offset_max = month_row["clock_offset_max"]
+
+    # Clock-offset sensitivity: one sweep over zone-change events, never a
+    # full reclassification per allowed offset. The ordinary report below
+    # still uses the original outbound instants unchanged.
+    clock_analysis = clock_mod.build_clock_analysis(
+        shipments, grouped, offset_min, offset_max
+    )
 
     buckets = {}
     unclassified = []
@@ -432,6 +442,8 @@ def build_report(conn, month, requested_version=None):
             "total_boxes": month_row["total_boxes"],
             "frozen_at": month_row["frozen_at"],
             "source_filename": month_row["source_filename"],
+            "clock_offset_min": month_row["clock_offset_min"],
+            "clock_offset_max": month_row["clock_offset_max"],
         },
         "version": (
             {
@@ -450,6 +462,7 @@ def build_report(conn, month, requested_version=None):
             "shipment_count": len(unclassified),
             "shipments": unclassified,
         },
+        "clock_analysis": clock_analysis,
         "total_boxes": total_boxes,
         "total_shipments": len(shipments),
     }
@@ -513,6 +526,7 @@ def report_json(report):
                 _shipment_json(item) for item in report["unclassified"]["shipments"]
             ],
         },
+        "clock_analysis": report["clock_analysis"],
         "total_boxes": report["total_boxes"],
         "total_shipments": report["total_shipments"],
     }

@@ -8,13 +8,20 @@
     <h2>已固定月份</h2>
     {% if months %}
       <table>
-        <thead><tr><th>月份</th><th>行数</th><th>箱数</th><th>固定时刻</th><th></th></tr></thead>
+        <thead><tr><th>月份</th><th>行数</th><th>箱数</th><th>钟差偏移范围（秒）</th><th>固定时刻</th><th></th></tr></thead>
         <tbody>
         {% for month in months %}
           <tr>
             <td><strong>{{ month.month }}</strong></td>
             <td>{{ month.row_count }}</td>
             <td>{{ month.total_boxes }}</td>
+            <td class="mono">
+              {% if month.clock_offset_min == 0 and month.clock_offset_max == 0 %}
+                <span class="muted">0（未填）</span>
+              {% else %}
+                {{ '%+d'|format(month.clock_offset_min) }} ~ {{ '%+d'|format(month.clock_offset_max) }}
+              {% endif %}
+            </td>
             <td class="mono">{{ display_utc(month.frozen_at) }}</td>
             <td><a href="{{ url_for('report_page', month=month.month) }}">核对月报</a></td>
           </tr>

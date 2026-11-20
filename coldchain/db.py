@@ -26,7 +26,12 @@ CREATE TABLE IF NOT EXISTS months (
     source_sha256        TEXT NOT NULL,
     row_count            INTEGER NOT NULL,
     total_boxes          INTEGER NOT NULL,
-    frozen_at            TEXT NOT NULL
+    frozen_at            TEXT NOT NULL,
+    clock_offset_min     INTEGER NOT NULL DEFAULT 0
+        CHECK (clock_offset_min BETWEEN -3600 AND 3600),
+    clock_offset_max     INTEGER NOT NULL DEFAULT 0
+        CHECK (clock_offset_max BETWEEN -3600 AND 3600),
+    CHECK (clock_offset_min <= clock_offset_max)
 );
 
 CREATE TABLE IF NOT EXISTS shipments (
@@ -155,10 +160,28 @@ def connect(path):
     return conn
 
 
+def _migrate_months_offset_columns(conn):
+    """Add clock offset columns to a database created before the feature.
+
+    Old month facts keep the documented semantics: no range was filled in,
+    so both bounds default to 0 seconds.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(months)").fetchall()}
+    if not columns or "clock_offset_min" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE months ADD COLUMN clock_offset_min INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        "ALTER TABLE months ADD COLUMN clock_offset_max INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 def init_db(path):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_months_offset_columns(conn)
         conn.executescript(IMMUTABLE_TRIGGERS)
     finally:
         conn.close()
